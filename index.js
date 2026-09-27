@@ -11,32 +11,74 @@ import makeWASocket, {
 import sharp from "sharp";
 import pino from "pino";
 
-// ============ Configuration ============
+// ============================================================
+// CONFIGURAÇÃO
+// ============================================================
 const PREFIX = process.env.BOT_PREFIX?.trim() || "?";
 const PAIRING_NUMBER = String(process.env.PAIRING_NUMBER || "").replace(/\D/g, "");
 const PORT = Number(process.env.PORT) || 8080;
 const ENABLE_EVAL = process.env.ENABLE_EVAL === "true";
 const OWNER_JIDS = new Set(
-  (process.env.OWNER_JIDS || "").split(",").filter(Boolean).map((j) => j.trim())
+  (process.env.OWNER_JIDS || "")
+    .split(",")
+    .map((jid) => jid.trim())
+    .filter(Boolean)
 );
 
-// ============ Session Management - Render Compatible ============
-const USE_RENDER_SESSION = !!process.env.RENDER;
-const SESSION_DIR = USE_RENDER_SESSION 
-  ? "/tmp/wa_session" 
+// ============================================================
+// SESSÃO (compatível com Render)
+// ============================================================
+const USE_RENDER_SESSION = Boolean(process.env.RENDER);
+const SESSION_DIR = USE_RENDER_SESSION
+  ? "/tmp/wa_session"
   : path.join(process.cwd(), "data", "auth_info_baileys");
 
+// ============================================================
+// LOGGER
+// ============================================================
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const waLogger = logger.child({ component: "whatsapp" });
 
-let socket = null;
-let stopping = false;
-let reconnectAttempt = 0;
-let menuSessions = new Map();
-let messageStore = new Map();
-let pairingCodeGenerated = false;
+// ============================================================
+// ESTADO GLOBAL
+// (agrupado num único objeto em vez de vários `let` soltos)
+// ============================================================
+const state = {
+  socket: null,
+  stopping: false,
+  reconnectAttempt: 0,
+  pairingCodeGenerated: false,
+};
 
-// ============ Utility Functions ============
+const menuSessions = new Map();
+const messageStore = new Map();
+
+// ============================================================
+// TEXTOS / CONSTANTES DE MENU
+// (antes duplicados dentro de sendMenu() e handleMenuPoll())
+// ============================================================
+const MENU_OPTIONS = ["📸 Figuras", "👮 Moderação", "🛠️ Utilitários", "ℹ️ Sobre"];
+
+const MENU_RESPONSES = {
+  "📸 Figuras": () =>
+    `*🖼️ MENU FIGURAS*\n\n${PREFIX}s - Responda uma figurinha para converter em imagem\n${PREFIX}img - Responda uma imagem para converter em figurinha\n${PREFIX}fig - Alias de figurinha`,
+  "👮 Moderação": () =>
+    `*👮 MENU MODERAÇÃO* (Apenas admins)\n\n${PREFIX}ban @user - Remove um membro\n${PREFIX}promote @user - Promove a administrador\n${PREFIX}demote @user - Remove de administrador`,
+  "🛠️ Utilitários": () =>
+    `*🛠️ MENU UTILITÁRIOS*\n\n${PREFIX}ping - Verifica se o bot está online\n${PREFIX}uptime - Mostra tempo de atividade\n${PREFIX}info - Informações da mensagem`,
+  "ℹ️ Sobre": () =>
+    `*ℹ️ SOBRE O BOT*\n\n🤖 SyntraxBot v1.1\nBot de WhatsApp usando Baileys\n👥 Suporte a grupos e privados\n⚡ Comandos: ${PREFIX}menu\n\nPrefix: ${PREFIX}`,
+};
+
+const GROUP_ACTION_LABELS = {
+  remove: "🗑️ Membro removido do grupo!",
+  promote: "⬆️ Usuário promovido a administrador!",
+  demote: "⬇️ Administrador rebaixado.",
+};
+
+// ============================================================
+// UTILITÁRIOS GERAIS
+// ============================================================
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function normalizeJid(jid) {
@@ -88,15 +130,29 @@ function senderOf(message) {
 }
 
 function storeMessage(message) {
-  if (message?.key?.id) {
-    messageStore.set(message.key.id, message);
-    if (messageStore.size > 1000) {
-      messageStore.delete(messageStore.keys().next().value);
-    }
+  if (!message?.key?.id) return;
+  messageStore.set(message.key.id, message);
+  if (messageStore.size > 1000) {
+    messageStore.delete(messageStore.keys().next().value);
   }
 }
 
-// ============ Poll/Menu Handling ============
+/**
+ * Envia uma resposta citando a mensagem original.
+ * Centraliza o padrão `sendMessage(jid, content, { quoted: message })`
+ * que antes se repetia em quase toda função.
+ */
+async function reply(jid, message, content) {
+  return state.socket.sendMessage(jid, content, { quoted: message });
+}
+
+async function replyError(jid, message, error) {
+  return reply(jid, message, { text: `❌ Erro: ${error.message}` });
+}
+
+// ============================================================
+// MENU / ENQUETES
+// ============================================================
 function getPollUpdate(message) {
   return unwrap(message).pollUpdateMessage || null;
 }
@@ -107,17 +163,15 @@ function getPollKey(update) {
 }
 
 async function sendMenu(jid, sender) {
-  const menuOptions = ["📸 Figuras", "👮 Moderação", "🛠️ Utilitários", "ℹ️ Sobre"];
-  
-  const poll = await socket.sendMessage(jid, {
+  const poll = await state.socket.sendMessage(jid, {
     poll: {
       name: "Menu SyntraxBot",
-      values: menuOptions,
+      values: MENU_OPTIONS,
       selectableCount: 1,
     },
   });
 
-  const response = await socket.sendMessage(
+  const response = await state.socket.sendMessage(
     jid,
     { text: "*Selecione uma categoria acima ☝️*" },
     { quoted: poll }
@@ -146,54 +200,43 @@ async function handleMenuPoll(message) {
     pollUpdates: [message],
   });
 
-  const menuOptions = ["📸 Figuras", "👮 Moderação", "🛠️ Utilitários", "ℹ️ Sobre"];
-  const selected = menuOptions.find((opt) => votes?.[opt]?.length > 0);
-
+  const selected = MENU_OPTIONS.find((option) => votes?.[option]?.length > 0);
   if (!selected) return true;
 
-  const menuResponses = {
-    "📸 Figuras": `*🖼️ MENU FIGURAS*\n\n${PREFIX}s - Responda uma figurinha para converter em imagem\n${PREFIX}img - Responda uma imagem para converter em figurinha\n${PREFIX}fig - Alias de figurinha`,
-    "👮 Moderação": `*👮 MENU MODERAÇÃO* (Apenas admins)\n\n${PREFIX}ban @user - Remove um membro\n${PREFIX}promote @user - Promove a administrador\n${PREFIX}demote @user - Remove de administrador`,
-    "🛠️ Utilitários": `*🛠️ MENU UTILITÁRIOS*\n\n${PREFIX}ping - Verifica se o bot está online\n${PREFIX}uptime - Mostra tempo de atividade\n${PREFIX}info - Informações da mensagem`,
-    "ℹ️ Sobre": `*ℹ️ SOBRE O BOT*\n\n🤖 SyntraxBot v1.1\nBot de WhatsApp usando Baileys\n👥 Suporte a grupos e privados\n⚡ Comandos: ${PREFIX}menu\n\nPrefix: ${PREFIX}`,
-  };
-
-  await socket.sendMessage(jid, { text: menuResponses[selected], edit: session.responseKey });
+  // Nota: usa session.jid (chat onde a enquete foi criada), não uma
+  // variável `jid` solta — ver observação no final da entrega.
+  await state.socket.sendMessage(session.jid, {
+    text: MENU_RESPONSES[selected](),
+    edit: session.responseKey,
+  });
   menuSessions.delete(getPollKey(update));
   return true;
 }
 
-// ============ Media Conversion ============
+// ============================================================
+// CONVERSÃO DE MÍDIA
+// ============================================================
+async function downloadAsBuffer(mediaMessage, mediaType) {
+  const stream = await downloadContentFromMessage(mediaMessage, mediaType);
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
 async function stickerToImage(message, jid) {
   try {
     const sticker = unwrap(message).stickerMessage;
     if (!sticker) {
-      await socket.sendMessage(
-        jid,
-        { text: `Responda uma figurinha com ${PREFIX}img` },
-        { quoted: message }
-      );
+      await reply(jid, message, { text: `Responda uma figurinha com ${PREFIX}img` });
       return;
     }
 
-    const buffer = await downloadContentFromMessage(sticker, "image");
-    const chunks = [];
-    for await (const chunk of buffer) chunks.push(chunk);
-    const imageBuffer = Buffer.concat(chunks);
-
+    const imageBuffer = await downloadAsBuffer(sticker, "image");
     const image = await sharp(imageBuffer).png().toBuffer();
-    await socket.sendMessage(
-      jid,
-      { image, caption: "🖼️ Sua imagem" },
-      { quoted: message }
-    );
+    await reply(jid, message, { image, caption: "🖼️ Sua imagem" });
   } catch (error) {
     waLogger.error({ err: error }, "Erro ao converter figurinha para imagem");
-    await socket.sendMessage(
-      jid,
-      { text: `❌ Erro: ${error.message}` },
-      { quoted: message }
-    );
+    await replyError(jid, message, error);
   }
 }
 
@@ -201,43 +244,33 @@ async function imageToSticker(message, jid) {
   try {
     const image = unwrap(message).imageMessage;
     if (!image) {
-      await socket.sendMessage(
-        jid,
-        { text: `Responda uma imagem com ${PREFIX}s` },
-        { quoted: message }
-      );
+      await reply(jid, message, { text: `Responda uma imagem com ${PREFIX}s` });
       return;
     }
 
-    const buffer = await downloadContentFromMessage(image, "image");
-    const chunks = [];
-    for await (const chunk of buffer) chunks.push(chunk);
-    const imageBuffer = Buffer.concat(chunks);
-
+    const imageBuffer = await downloadAsBuffer(image, "image");
     const webp = await sharp(imageBuffer)
       .resize(512, 512, { fit: "cover", withoutEnlargement: false })
       .webp()
       .toBuffer();
 
-    await socket.sendMessage(jid, { sticker: webp }, { quoted: message });
+    await reply(jid, message, { sticker: webp });
   } catch (error) {
     waLogger.error({ err: error }, "Erro ao converter imagem para figurinha");
-    await socket.sendMessage(
-      jid,
-      { text: `❌ Erro: ${error.message}` },
-      { quoted: message }
-    );
+    await replyError(jid, message, error);
   }
 }
 
-// ============ Group Commands ============
+// ============================================================
+// COMANDOS DE GRUPO
+// ============================================================
 async function getGroupInfo(jid, sender) {
-  const metadata = await socket.groupMetadata(jid);
+  const metadata = await state.socket.groupMetadata(jid);
   const senderParticipant = metadata.participants.find(
     (p) => normalizeJid(p.id) === normalizeJid(sender)
   );
   const botParticipant = metadata.participants.find(
-    (p) => normalizeJid(p.id) === normalizeJid(socket.user.id)
+    (p) => normalizeJid(p.id) === normalizeJid(state.socket.user.id)
   );
 
   return {
@@ -250,72 +283,39 @@ async function getGroupInfo(jid, sender) {
 
 async function handleGroupAction(jid, sender, action, mention, message) {
   if (!isGroup(jid)) {
-    await socket.sendMessage(
-      jid,
-      { text: "Este comando só funciona em grupos." },
-      { quoted: message }
-    );
+    await reply(jid, message, { text: "Este comando só funciona em grupos." });
     return;
   }
 
   const group = await getGroupInfo(jid, sender);
-  
+
   if (!group.isAdmin) {
-    await socket.sendMessage(
-      jid,
-      { text: "👮 Apenas administradores podem usar este comando." },
-      { quoted: message }
-    );
+    await reply(jid, message, { text: "👮 Apenas administradores podem usar este comando." });
     return;
   }
 
   if (!group.isBotAdmin) {
-    await socket.sendMessage(
-      jid,
-      { text: "🤖 Eu preciso ser administrador do grupo para isso." },
-      { quoted: message }
-    );
+    await reply(jid, message, { text: "🤖 Eu preciso ser administrador do grupo para isso." });
     return;
   }
 
   if (!mention || mention.length === 0) {
-    await socket.sendMessage(
-      jid,
-      { text: `Use: ${PREFIX}${action} @usuario` },
-      { quoted: message }
-    );
+    await reply(jid, message, { text: `Use: ${PREFIX}${action} @usuario` });
     return;
   }
 
   try {
-    await socket.groupParticipantsUpdate(
-      jid,
-      [mention[0] + "@s.whatsapp.net"],
-      action
-    );
-
-    const responses = {
-      remove: "🗑️ Membro removido do grupo!",
-      promote: "⬆️ Usuário promovido a administrador!",
-      demote: "⬇️ Administrador rebaixado.",
-    };
-
-    await socket.sendMessage(
-      jid,
-      { text: responses[action] || "Ação realizada!" },
-      { quoted: message }
-    );
+    await state.socket.groupParticipantsUpdate(jid, [mention[0] + "@s.whatsapp.net"], action);
+    await reply(jid, message, { text: GROUP_ACTION_LABELS[action] || "Ação realizada!" });
   } catch (error) {
     waLogger.error({ err: error, action }, "Erro em comando de grupo");
-    await socket.sendMessage(
-      jid,
-      { text: `❌ Erro: ${error.message}` },
-      { quoted: message }
-    );
+    await replyError(jid, message, error);
   }
 }
 
-// ============ Info Command ============
+// ============================================================
+// INFO DA MENSAGEM
+// ============================================================
 async function sendMessageInfo(jid, message) {
   try {
     const content = unwrap(message);
@@ -335,47 +335,29 @@ async function sendMessageInfo(jid, message) {
     const formatted = JSON.stringify(info, null, 2);
     const output = formatted.length > 4096 ? formatted.slice(0, 4000) + "..." : formatted;
 
-    await socket.sendMessage(
-      jid,
-      { text: "```\n" + output + "\n```" },
-      { quoted: message }
-    );
+    await reply(jid, message, { text: "```\n" + output + "\n```" });
   } catch (error) {
     waLogger.error({ err: error }, "Erro ao gerar info");
-    await socket.sendMessage(
-      jid,
-      { text: `❌ Erro: ${error.message}` },
-      { quoted: message }
-    );
+    await replyError(jid, message, error);
   }
 }
 
-// ============ Code Execution ============
+// ============================================================
+// EXECUÇÃO DE CÓDIGO (owner only)
+// ============================================================
 async function executeCode(jid, sender, code, message) {
   if (!ENABLE_EVAL) {
-    await socket.sendMessage(
-      jid,
-      { text: "⛔ Execução de código está desativada." },
-      { quoted: message }
-    );
+    await reply(jid, message, { text: "⛔ Execução de código está desativada." });
     return;
   }
 
   if (!isOwner(sender)) {
-    await socket.sendMessage(
-      jid,
-      { text: "🔐 Apenas o proprietário pode executar código." },
-      { quoted: message }
-    );
+    await reply(jid, message, { text: "🔐 Apenas o proprietário pode executar código." });
     return;
   }
 
   if (!code.trim()) {
-    await socket.sendMessage(
-      jid,
-      { text: `Uso: ${PREFIX}execute <código JavaScript>` },
-      { quoted: message }
-    );
+    await reply(jid, message, { text: `Uso: ${PREFIX}execute <código JavaScript>` });
     return;
   }
 
@@ -389,7 +371,7 @@ async function executeCode(jid, sender, code, message) {
       `return (async () => {
         ${code}
       })()`
-    )(socket, jid, sender, message, sleep);
+    )(state.socket, jid, sender, message, sleep);
 
     const output =
       result === undefined
@@ -398,135 +380,119 @@ async function executeCode(jid, sender, code, message) {
           ? result
           : JSON.stringify(result, null, 2);
 
-    await socket.sendMessage(
-      jid,
-      { text: "```\n" + output.slice(0, 4000) + "\n```" },
-      { quoted: message }
-    );
+    await reply(jid, message, { text: "```\n" + output.slice(0, 4000) + "\n```" });
   } catch (error) {
     waLogger.error({ err: error }, "Erro ao executar código");
-    await socket.sendMessage(
-      jid,
-      { text: "```\n" + error.message.slice(0, 500) + "\n```" },
-      { quoted: message }
-    );
+    await reply(jid, message, { text: "```\n" + error.message.slice(0, 500) + "\n```" });
   }
 }
 
-// ============ Command Handler ============
-async function handleCommand(socket, message, jid, sender, text) {
+// ============================================================
+// ROTEAMENTO DE COMANDOS
+// (mesmo mapeamento do switch original, agora como tabela)
+// ============================================================
+const COMMAND_HANDLERS = {
+  menu: (ctx) => sendMenu(ctx.jid, ctx.sender),
+  help: (ctx) => sendMenu(ctx.jid, ctx.sender),
+
+  ping: (ctx) => reply(ctx.jid, ctx.message, { text: "🏓 Pong!" }),
+
+  uptime: (ctx) => {
+    const uptime = Math.floor(process.uptime());
+    const h = Math.floor(uptime / 3600);
+    const m = Math.floor((uptime % 3600) / 60);
+    const s = uptime % 60;
+    return reply(ctx.jid, ctx.message, { text: `⏱️ Bot ativo há ${h}h ${m}m ${s}s` });
+  },
+
+  info: (ctx) => sendMessageInfo(ctx.jid, ctx.message),
+
+  // ⚠️ mantido idêntico ao original: "s"/"fig" convertem IMAGEM -> figurinha
+  s: (ctx) => imageToSticker(ctx.message, ctx.jid),
+  sticker: (ctx) => imageToSticker(ctx.message, ctx.jid),
+  fig: (ctx) => imageToSticker(ctx.message, ctx.jid),
+
+  // ⚠️ mantido idêntico ao original: "img"/"toimg"/"imagem" convertem figurinha -> IMAGEM
+  img: (ctx) => stickerToImage(ctx.message, ctx.jid),
+  toimg: (ctx) => stickerToImage(ctx.message, ctx.jid),
+  imagem: (ctx) => stickerToImage(ctx.message, ctx.jid),
+
+  ban: (ctx) => handleGroupAction(ctx.jid, ctx.sender, "remove", ctx.args, ctx.message),
+  promote: (ctx) => handleGroupAction(ctx.jid, ctx.sender, "promote", ctx.args, ctx.message),
+  demote: (ctx) => handleGroupAction(ctx.jid, ctx.sender, "demote", ctx.args, ctx.message),
+
+  execute: (ctx) => executeCode(ctx.jid, ctx.sender, ctx.body, ctx.message),
+  exec: (ctx) => executeCode(ctx.jid, ctx.sender, ctx.body, ctx.message),
+  eval: (ctx) => executeCode(ctx.jid, ctx.sender, ctx.body, ctx.message),
+};
+
+async function handleCommand(message, jid, sender, text) {
   const parts = text.slice(PREFIX.length).trim().split(/\s+/);
   const command = (parts.shift() || "").toLowerCase();
   const args = parts;
   const body = args.join(" ");
 
-  switch (command) {
-    case "menu":
-    case "help":
-      return sendMenu(jid, sender);
-
-    case "ping":
-      return socket.sendMessage(jid, { text: "🏓 Pong!" }, { quoted: message });
-
-    case "uptime": {
-      const uptime = Math.floor(process.uptime());
-      const h = Math.floor(uptime / 3600);
-      const m = Math.floor((uptime % 3600) / 60);
-      const s = uptime % 60;
-      return socket.sendMessage(
-        jid,
-        { text: `⏱️ Bot ativo há ${h}h ${m}m ${s}s` },
-        { quoted: message }
-      );
-    }
-
-    case "info":
-      return sendMessageInfo(jid, message);
-
-    case "s":
-    case "sticker":
-    case "fig":
-      return imageToSticker(message, jid);
-
-    case "img":
-    case "toimg":
-    case "imagem":
-      return stickerToImage(message, jid);
-
-    case "ban":
-      return handleGroupAction(jid, sender, "remove", args, message);
-
-    case "promote":
-      return handleGroupAction(jid, sender, "promote", args, message);
-
-    case "demote":
-      return handleGroupAction(jid, sender, "demote", args, message);
-
-    case "execute":
-    case "exec":
-    case "eval":
-      return executeCode(jid, sender, body, message);
-
-    default:
-      return socket.sendMessage(
-        jid,
-        { text: `❌ Comando não encontrado. Use ${PREFIX}menu para ver as opções.` },
-        { quoted: message }
-      );
+  const handler = COMMAND_HANDLERS[command];
+  if (!handler) {
+    await reply(jid, message, {
+      text: `❌ Comando não encontrado. Use ${PREFIX}menu para ver as opções.`,
+    });
+    return;
   }
+
+  return handler({ jid, sender, message, args, body });
 }
 
-// ============ Connection Setup ============
+// ============================================================
+// CONEXÃO
+// ============================================================
 async function connect() {
   await fs.promises.mkdir(SESSION_DIR, { recursive: true });
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  const { state: authState, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
 
-  socket = makeWASocket({
-    auth: state,
+  const socket = makeWASocket({
+    auth: authState,
     browser: Browsers.ubuntu("SyntraxBot"),
     logger: waLogger,
     syncFullHistory: false,
     markOnlineOnConnect: false,
     generateHighQualityLinkPreview: false,
   });
+  state.socket = socket;
 
   socket.ev.on("creds.update", saveCreds);
 
-  // Flag para controlar quando gerar pairing code
+  // Controla quando o pairing code pode ser solicitado
   let isSocketReady = false;
 
   socket.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // Socket está pronto quando recebe QR ou connection event
     if (qr) {
       isSocketReady = true;
       waLogger.info("🔲 QR Code disponível para scan");
     }
 
-    // Gerar pairing code APENAS quando:
-    // 1. Socket está pronto (isSocketReady = true)
-    // 2. Não foi gerado antes (pairingCodeGenerated = false)
-    // 3. Não há sessão registrada
-    // 4. PAIRING_NUMBER está definido
+    // Gerar pairing code apenas quando: socket pronto, ainda não gerado,
+    // sessão não registrada e PAIRING_NUMBER configurado.
     if (
       isSocketReady &&
-      !pairingCodeGenerated &&
+      !state.pairingCodeGenerated &&
       !socket.authState.creds.registered &&
       PAIRING_NUMBER
     ) {
-      pairingCodeGenerated = true;
+      state.pairingCodeGenerated = true;
       try {
         const code = await socket.requestPairingCode(PAIRING_NUMBER);
         waLogger.info({ pairingCode: code }, `🔑 Código de pareamento gerado (${PAIRING_NUMBER})`);
       } catch (error) {
         waLogger.error({ err: error }, "⚠️  Erro ao gerar código de pareamento - continuando...");
-        pairingCodeGenerated = false; // Permitir tentar novamente
+        state.pairingCodeGenerated = false;
       }
     }
 
     if (connection === "open") {
-      reconnectAttempt = 0;
+      state.reconnectAttempt = 0;
       waLogger.info(
         { account: socket.user?.id, environment: USE_RENDER_SESSION ? "RENDER" : "LOCAL" },
         "✅ WhatsApp conectado!"
@@ -534,12 +500,12 @@ async function connect() {
       return;
     }
 
-    if (connection !== "close" || stopping) return;
+    if (connection !== "close" || state.stopping) return;
 
-    socket = null;
+    state.socket = null;
     isSocketReady = false;
-    pairingCodeGenerated = false;
-    
+    state.pairingCodeGenerated = false;
+
     const statusCode = lastDisconnect?.error?.output?.statusCode;
     const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
@@ -548,11 +514,14 @@ async function connect() {
       return;
     }
 
-    reconnectAttempt++;
-    const delay = Math.min(30_000, 1_000 * 2 ** Math.min(reconnectAttempt, 5));
-    waLogger.warn({ statusCode, delay, attempt: reconnectAttempt }, "🔄 Reconectando...");
-    await sleep(delay);
-    if (!stopping) await connect();
+    state.reconnectAttempt++;
+    const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(state.reconnectAttempt, 5));
+    waLogger.warn(
+      { statusCode, delay: delayMs, attempt: state.reconnectAttempt },
+      "🔄 Reconectando..."
+    );
+    await sleep(delayMs);
+    if (!state.stopping) await connect();
   });
 
   socket.ev.on("messages.upsert", async (event) => {
@@ -579,56 +548,68 @@ async function connect() {
       if (!jid || !text.startsWith(PREFIX)) continue;
 
       try {
-        await handleCommand(socket, message, jid, senderOf(message), text);
+        await handleCommand(message, jid, senderOf(message), text);
       } catch (error) {
         waLogger.error({ err: error }, "Erro ao processar comando");
-        await socket.sendMessage(
-          jid,
-          { text: `❌ Erro ao processar comando: ${error.message.slice(0, 100)}` },
-          { quoted: message }
-        );
+        await reply(jid, message, {
+          text: `❌ Erro ao processar comando: ${error.message.slice(0, 100)}`,
+        });
       }
     }
   });
 }
 
-// ============ HTTP Server ============
+// ============================================================
+// SERVIDOR HTTP (health check)
+// ============================================================
+const HEALTH_PATHS = new Set(["/", "/health", "/api/healthz"]);
+
 const server = createServer((request, response) => {
-  if (["/", "/health", "/api/healthz"].includes(request.url)) {
+  if (HEALTH_PATHS.has(request.url)) {
     response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-    response.end(JSON.stringify({ 
-      status: "ok", 
-      connected: !!socket,
-      environment: USE_RENDER_SESSION ? "RENDER (/tmp/wa_session)" : "LOCAL (./data/auth_info_baileys)"
-    }));
+    response.end(
+      JSON.stringify({
+        status: "ok",
+        connected: !!state.socket,
+        environment: USE_RENDER_SESSION
+          ? "RENDER (/tmp/wa_session)"
+          : "LOCAL (./data/auth_info_baileys)",
+      })
+    );
     return;
   }
   response.writeHead(404, { "content-type": "application/json; charset=utf-8" });
   response.end(JSON.stringify({ error: "Not found" }));
 });
 
-// ============ Shutdown Handler ============
+// ============================================================
+// ENCERRAMENTO
+// ============================================================
 async function shutdown(signal) {
-  if (stopping) return;
-  stopping = true;
+  if (state.stopping) return;
+  state.stopping = true;
   logger.info({ signal }, "Encerrando processo");
   try {
-    socket?.end?.(new Error("Encerramento solicitado"));
+    state.socket?.end?.(new Error("Encerramento solicitado"));
   } finally {
     server.close(() => process.exit(0));
   }
 }
 
-// ============ Start Server ============
+// ============================================================
+// INICIALIZAÇÃO
+// ============================================================
 server.listen(PORT, () => {
-  const env = USE_RENDER_SESSION ? "🚀 RENDER" : "💻 LOCAL";
-  logger.info({ 
-    port: PORT, 
-    sessionDir: SESSION_DIR,
-    environment: env,
-    pairingNumber: PAIRING_NUMBER ? "Configurado" : "Não configurado"
-  }, "Servidor HTTP iniciado");
-  
+  logger.info(
+    {
+      port: PORT,
+      sessionDir: SESSION_DIR,
+      environment: USE_RENDER_SESSION ? "🚀 RENDER" : "💻 LOCAL",
+      pairingNumber: PAIRING_NUMBER ? "Configurado" : "Não configurado",
+    },
+    "Servidor HTTP iniciado"
+  );
+
   connect().catch((error) => {
     logger.error({ err: error }, "Falha ao iniciar o bot");
     process.exitCode = 1;
