@@ -489,7 +489,22 @@ async function connect() {
   socket.ev.on("creds.update", saveCreds);
 
   socket.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
+
+    // Handle QR code or pairing code
+    if (qr) {
+      waLogger.info("QR Code disponível para scan");
+    }
+
+    // Handle pairing code - CORRETO CONFORME BAILEYS
+    if (!socket.authState.creds.registered && PAIRING_NUMBER) {
+      try {
+        const code = await socket.requestPairingCode(PAIRING_NUMBER);
+        waLogger.info({ pairingCode: code }, `Código de pareamento (${PAIRING_NUMBER})`);
+      } catch (error) {
+        waLogger.error({ err: error }, "Erro ao gerar código de pareamento");
+      }
+    }
 
     if (connection === "open") {
       reconnectAttempt = 0;
@@ -550,12 +565,6 @@ async function connect() {
       }
     }
   });
-
-  if (!state.creds.registered && PAIRING_NUMBER) {
-    await sleep(1_000);
-    const code = await socket.requestPairingCode(PAIRING_NUMBER);
-    waLogger.info({ pairingCode: code }, "Código de pareamento gerado");
-  }
 }
 
 // ============ HTTP Server ============
