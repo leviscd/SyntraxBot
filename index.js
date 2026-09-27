@@ -2,7 +2,6 @@ import { createServer } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import makeWASocket, {
-  Browsers,
   DisconnectReason,
   useMultiFileAuthState,
   downloadContentFromMessage,
@@ -453,7 +452,6 @@ async function connect() {
 
   const socket = makeWASocket({
     auth: authState,
-    browser: Browsers.ubuntu("Chrome"),
     logger: waLogger,
     syncFullHistory: false,
     markOnlineOnConnect: false,
