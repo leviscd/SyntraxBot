@@ -48,6 +48,7 @@ const state = {
   stopping: false,
   reconnectAttempt: 0,
   pairingCodeGenerated: false,
+  connected: false, // só true entre "open" e o "close" seguinte
 };
 
 const menuSessions = new Map();
@@ -493,6 +494,7 @@ async function connect() {
 
     if (connection === "open") {
       state.reconnectAttempt = 0;
+      state.connected = true;
       waLogger.info(
         { account: socket.user?.id, environment: USE_RENDER_SESSION ? "RENDER" : "LOCAL" },
         "✅ WhatsApp conectado!"
@@ -503,6 +505,7 @@ async function connect() {
     if (connection !== "close" || state.stopping) return;
 
     state.socket = null;
+    state.connected = false;
     isSocketReady = false;
     state.pairingCodeGenerated = false;
 
@@ -570,7 +573,8 @@ const server = createServer((request, response) => {
     response.end(
       JSON.stringify({
         status: "ok",
-        connected: !!state.socket,
+        connected: state.connected, // true só depois de "open" de verdade
+        socketActive: !!state.socket, // existe um socket tentando conectar
         environment: USE_RENDER_SESSION
           ? "RENDER (/tmp/wa_session)"
           : "LOCAL (./data/auth_info_baileys)",
