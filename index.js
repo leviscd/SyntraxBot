@@ -62,6 +62,8 @@ const logger = pino({ level: 'silent' }) // mude pra 'info' se quiser ver os log
 const activeMenus = new Map()
 
 let pairingCodeRequested = false
+let reconnectAttempts = 0
+const MAX_RECONNECT_DELAY_MS = 30000 // nunca espera mais que 30s entre tentativas
 
 // ============================================================
 // CONTEÚDO DO MENU
@@ -346,16 +348,36 @@ async function startBot() {
         ? lastDisconnect.error.output.statusCode
         : null
 
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+      // Loga o motivo real da queda - essencial pra diagnosticar se voltar a travar
+      console.log(`Conexão fechada. Código: ${statusCode ?? 'desconhecido'} | Motivo: ${lastDisconnect?.error?.message || 'sem detalhes'}`)
 
-      console.log('Conexão fechada.', shouldReconnect ? 'Reconectando...' : 'Sessão encerrada (logout).')
+      switch (statusCode) {
+        case DisconnectReason.loggedOut:
+          console.log(`❌ Sessão desconectada pelo WhatsApp (logout). Apague a pasta "${SESSION_DIR}" e pareie novamente.`)
+          break
 
-      if (shouldReconnect) {
-        pairingCodeRequested = false
-        startBot()
+        case DisconnectReason.badSession:
+          console.log(`❌ Sessão corrompida. Apague a pasta "${SESSION_DIR}" e pareie novamente.`)
+          break
+
+        case DisconnectReason.connectionReplaced:
+          console.log('❌ Essa sessão foi aberta em outro lugar (outra instância rodando com a mesma pasta de sessão?). Encerrando esta instância.')
+          break
+
+        default: {
+          // connectionClosed, connectionLost, restartRequired, timedOut, erros genéricos (ex: 428), etc.
+          // Reconecta, mas com espera crescente pra não ficar martelando o WhatsApp e piorar bloqueio.
+          reconnectAttempts++
+          const waitMs = Math.min(1000 * 2 ** reconnectAttempts, MAX_RECONNECT_DELAY_MS)
+          console.log(`Reconectando em ${Math.round(waitMs / 1000)}s (tentativa ${reconnectAttempts})...`)
+          await delay(waitMs)
+          pairingCodeRequested = false
+          startBot()
+        }
       }
     } else if (connection === 'open') {
       console.log('✅ Bot conectado com sucesso!')
+      reconnectAttempts = 0
     }
   })
 
