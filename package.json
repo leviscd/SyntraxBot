@@ -1,7 +1,7 @@
 {
-  "name": "baileys-whatsapp-bot",
+  "name": "syntraxbot",
   "version": "1.0.0",
-  "description": "Bot WhatsApp usando Baileys v7",
+  "private": true,
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -9,11 +9,11 @@
     "dev": "node --watch index.js"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20"
   },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "@whiskeysockets/baileys": "6.7.24",
     "pino": "^9.7.0",
     "sharp": "^0.34.3"
   }
