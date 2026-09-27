@@ -694,6 +694,7 @@ function waitForClose(socket, registered) {
       if (connection === "open") {
         reconnectAttempts = 0;
         waLogger.info({ account: socket.user?.id }, "WhatsApp conectado");
+        // Socket keep alive - don't close immediately
         return;
       }
 
@@ -811,3 +812,4 @@ function shutdown(signal) {
 
 process.once("SIGTERM", () => shutdown("SIGTERM"));
 process.once("SIGINT", () => shutdown("SIGINT"));
+
