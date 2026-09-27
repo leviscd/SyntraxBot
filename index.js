@@ -1,1 +1,158 @@
-import { createServer } from \"node:http\";\nimport fs from \"node:fs\";\nimport path from \"node:path\";\n\nconst {\n  default: makeWASocket,\n  Browsers,\n  DisconnectReason,\n  downloadMediaMessage,\n  getAggregateVotesInPollMessage,\n  useMultiFileAuthState,\n} = await import(\"baileys\").catch(() => import(\"@whiskeysockets/baileys\"));\nimport pino from \"pino\";\nimport sharp from \"sharp\";\n\nconst PREFIX = process.env.BOT_PREFIX?.trim() || \"?\";\nconst PAIRING_NUMBER = digitsOnly(process.env.PAIRING_NUMBER);\nconst OWNER_JIDS = parseOwnerJids();\nconst ENABLE_EVAL = process.env.ENABLE_EVAL === \"true\";\nconst SESSION_DIR = resolveSessionDir();\nconst MAX_RECONNECT_DELAY = 30_000;\nconst startedAt = Date.now();\n\nconst logger = pino({ level: process.env.LOG_LEVEL || \"info\" });\nconst waLogger = logger.child({ component: \"whatsapp\" });\nconst messages = new Map();\nconst menuSessions = new Map();\n\nlet running = false;\nlet stopping = false;\nlet reconnectAttempts = 0;\nlet currentSocket = null;\n\nconst SUBMENUS = {\n  \"1\": [\n    \"FIGURINHAS\",\n    \"\",\n    `• ${PREFIX}sticker — imagem para figurinha`,\n    `• ${PREFIX}s — imagem para figurinha`,\n    `• ${PREFIX}fig — imagem para figurinha`,\n    `• ${PREFIX}img — figurinha para imagem`,\n    `• ${PREFIX}toimg — figurinha para imagem`,\n  ].join(\"\\n\"),\n  \"2\": [\n    \"ADMINISTRAÇÃO\",\n    \"\",\n    `• ${PREFIX}ban @usuario`,\n    `• ${PREFIX}promote @usuario`,\n    `• ${PREFIX}demote @usuario`,\n    `• ${PREFIX}everyone mensagem`,\n  ].join(\"\\n\"),\n  \"3\": [\n    \"UTILITÁRIOS\",\n    \"\",\n    `• ${PREFIX}ping`,\n    `• ${PREFIX}uptime`,\n    `• ${PREFIX}info`,\n  ].join(\"\\n\"),\n  \"4\": [\n    \"SOBRE O BOT\",\n    \"\",\n    \"SyntraXBot\",\n    \"Bot de WhatsApp usando Baileys.\",\n    \"\",\n    `Prefixo: ${PREFIX}`,\n  ].join(\"\\n\"),\n};\n\nfunction digitsOnly(value) {\n  return String(value || \"\").replace(/\\D/g, \"\");\n}\n\nfunction normalizeJid(jid) {\n  return String(jid || \"\")\n    .replace(/:\\d+(?=@)/, \"\")\n    .trim()\n    .toLowerCase();\n}\n\nfunction parseOwnerJids() {\n  const values = [\n    process.env.OWNER_JID,\n    process.env.OWNER_JIDS,\n    process.env.OWNER_NUMBER,\n    process.env.OWNER_NUMBERS,\n  ]\n    .filter(Boolean)\n    .flatMap((value) => value.split(\",\"))\n    .map((value) => value.trim())\n    .filter(Boolean);\n\n  return new Set(\n    values.map((value) =>\n      value.includes(\"@\")\n        ? normalizeJid(value)\n        : `${digitsOnly(value)}@s.whatsapp.net`,\n    ),\n  );\n}\n\nfunction resolveSessionDir() {\n  if (process.env.SESSION_DIR?.trim()) {\n    return path.resolve(process.env.SESSION_DIR.trim());\n  }\n\n  if (\n    process.env.RAILWAY_ENVIRONMENT ||\n    process.env.RAILWAY_PROJECT_ID ||\n    fs.existsSync(\"/data\")\n  ) {\n    return \"/data/auth_info_baileys\";\n  }\n\n  return path.join(process.cwd(), \".data\", \"auth_info_baileys\");\n}\n\nfunction wait(milliseconds) {\n  return new Promise((resolve) => setTimeout(resolve, milliseconds));\n}\n\nfunction describeError(error) {\n  return error instanceof Error ? error.message : String(error);\n}\n\nfunction statusCodeFrom(error) {\n  if (!error || typeof error !== \"object\") return undefined;\n  if (\n    error.output &&\n    typeof error.output === \"object\" &&\n    typeof error.output.statusCode === \"number\"\n  ) {\n    return error.output.statusCode;\n  }\n  return typeof error.statusCode === \"number\" ? error.statusCode : undefined;\n}\n\nfunction keyFor(key) {\n  return `${key.remoteJid || \"\"}:${key.id || \"\"}`;\n}\n\nfunction remember(message) {\n  if (!message?.key?.id) return;\n  messages.set(keyFor(message.key), message);\n  if (messages.size > 1000) {\n    messages.delete(messages.keys().next().value);\n  }\n}\n\nfunction pollUpdateOf(message) {\n  return unwrap(message).pollUpdateMessage || null;\n}\n\nfunction menuPollKey(update) {\n  return keyFor(update?.pollCreationMessageKey || {});\n}\n\nfunction menuOptions() {\n  return [\"Figurinhas\", \"Administração\", \"Utilitários\", \"Sobre o bot\"];\n}\n\nasync function sendMenu(socket, message, chatId, senderJid) {\n  const poll = await socket.sendMessage(chatId, {\n    poll: {\n      name: \"Menu do SyntraXBot\",\n      values: menuOptions(),\n      selectableCount: 1,\n    },\n  });\n  const response = await send(\n    socket,\n    chatId,\n    \"Selecione uma categoria na poll acima para ver os comandos.\",\n    message,\n  );\n\n  if (poll?.key?.id && response?.key?.id) {\n    menuSessions.set(keyFor(poll.key), {\n      chatId,\n      senderJid: normalizeJid(senderJid),\n      responseKey: response.key,\n      pollMessage: poll,\n      createdAt: Date.now(),\n    });\n  }\n}\n\nasync function handleMenuPoll(socket, message) {\n  const update = pollUpdateOf(message);\n  if (!update?.pollCreationMessageKey) return false;\n\n  const session = menuSessions.get(menuPollKey(update));\n  if (!session || normalizeJid(update.voterJid) !== session.senderJid) {\n    return true;\n  }\n\n  const creation = session.pollMessage;\n  const votes = getAggregateVotesInPollMessage({\n    message: creation,\n    pollUpdates: [message],\n  });\n  const selected = menuOptions().find((option) => votes?.[option]?.length > 0);\n  if (!selected) return true;\n\n  const index = menuOptions().indexOf(selected) + 1;\n  await socket.sendMessage(session.chatId, {\n    text: SUBMENUS[String(index)],\n    edit: session.responseKey,\n  });\n  menuSessions.delete(menuPollKey(update));\n  return true;\n}\n\nfunction unwrap(message) {\n  let content = message?.message;\n  while (content) {\n    const wrapper =\n      content.ephemeralMessage ||\n      content.viewOnceMessage ||\n      content.viewOnceMessageV2 ||\n      content.viewOnceMessageV2Extension ||\n      content.documentWithCaptionMessage;\n    if (!wrapper?.message) break;\n    content = wrapper.message;\n  }\n  return content || {};\n}\n\nfunction textOf(message) {\n  const content = unwrap(message);\n  return (\n    content.conversation ||\n    content.extendedTextMessage?.text ||\n    content.imageMessage?.caption ||\n    content.videoMessage?.caption ||\n    content.documentMessage?.caption ||\n    content.buttonsResponseMessage?.selectedButtonId ||\n    content.listResponseMessage?.singleSelectReply?.selectedRowId ||\n    content.templateButtonReplyMessage?.selectedId ||\n    \"\"\n  );\n}\n\nfunction contextOf(message) {\n  const content = unwrap(message);\n  return (\n    content.extendedTextMessage?.contextInfo ||\n    content.imageMessage?.contextInfo ||\n    content.videoMessage?.contextInfo ||\n    content.stickerMessage?.contextInfo ||\n    content.documentMessage?.contextInfo\n  );\n}\n\nfunction quotedOf(message) {\n  const context = contextOf(message);\n  if (!context?.quotedMessage) return null;\n\n  return {\n    key: {\n      remoteJid: message.key.remoteJid || undefined,\n      id: context.stanzaId || \"\",\n      fromMe: false,\n      ...(context.participant ? { participant: context.participant } : {}),\n    },\n    message: context.quotedMessage,\n  };\n}\n\nfunction mediaMessageOf(message, mediaType) {\n  if (unwrap(message)[mediaType]) return message;\n  const quoted = quotedOf(message);\n  return quoted && unwrap(quoted)[mediaType] ? quoted : null;\n}\n\nasync function mediaBuffer(socket, message, mediaType) {\n  const target = mediaMessageOf(message, mediaType);\n  if (!target) return null;\n\n  return downloadMediaMessage(\n    target,\n    \"buffer\",\n    {},\n    {\n      logger: waLogger,\n      reuploadRequest: (messageToUpdate) =>\n        socket.updateMediaMessage(messageToUpdate),\n    },\n  );\n}\n\nfunction senderOf(message) {\n  return message.key.participant || message.key.remoteJid || \"\";\n}\n\nfunction ownerOf(jid) {\n  return OWNER_JIDS.has(normalizeJid(jid));\n}\n\nfunction uptime() {\n  const seconds = Math.floor((Date.now() - startedAt) / 1000);\n  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ${seconds % 60}s`;\n}\n\nfunction menu() {\n  return [\n    \"SYNTRAXBOT\",\n    \"\",\n    \"Responda com o número da categoria:\",\n    \"1 - Figurinhas\",\n    \"2 - Administração\",\n    \"3 - Utilitários\",\n    \"4 - Sobre o bot\",\n    \"\",\n    `Use ${PREFIX}menu para abrir novamente.`,\n  ].join(\"\\n\");\n}\n\nasync function send(socket, chatId, text, quoted) {\n  return socket.sendMessage(\n    chatId,\n    { text },\n    quoted ? { quoted } : undefined,\n  );\n}\n\nasync function sticker(socket, message, chatId) {\n  try {\n    const buffer = await mediaBuffer(socket, message, \"imageMessage\");\n    if (!buffer) {\n      return send(\n        socket,\n        chatId,\n        `Responda uma imagem com ${PREFIX}sticker.`,\n        message,\n      );\n    }\n\n    const webp = await sharp(buffer)\n      .resize(512, 512, { fit: \"cover\" })\n      .webp()\n      .toBuffer();\n    await socket.sendMessage(chatId, { sticker: webp }, { quoted: message });\n  } catch (error) {\n    waLogger.error({ err: error }, \"Erro ao criar figurinha\");\n    await send(socket, chatId, `Erro ao criar figurinha: ${describeError(error)}`, message);\n  }\n}\n\nasync function toImage(socket, message, chatId) {\n  try {\n    const buffer = await mediaBuffer(socket, message, \"stickerMessage\");\n    if (!buffer) {\n      return send(\n        socket,\n        chatId,\n        `Responda uma figurinha com ${PREFIX}img.`,\n        message,\n      );\n    }\n\n    const image = await sharp(buffer).png().toBuffer();\n    await socket.sendMessage(\n      chatId,\n      { image, caption: \"Aqui está sua imagem.\" },\n      { quoted: message },\n    );\n  } catch (error) {\n    waLogger.error({ err: error }, \"Erro ao converter figurinha\");\n    await send(socket, chatId, `Erro ao converter figurinha: ${describeError(error)}`, message);\n  }\n}\n\nfunction admin(participant) {\n  return participant?.admin === \"admin\" || participant?.admin === \"superadmin\";\n}\n\nasync function groupData(socket, chatId, senderJid) {\n  const metadata = await socket.groupMetadata(chatId);\n  const sender = metadata.participants.find(\n    (participant) =>\n      normalizeJid(participant.id) === normalizeJid(senderJid),\n  );\n  const bot = metadata.participants.find(\n    (participant) =>\n      normalizeJid(participant.id) === normalizeJid(socket.user?.id),\n  );\n  return {\n    participants: metadata.participants,\n    senderAdmin: admin(sender),\n    botAdmin: admin(bot),\n  };\n}\n\nfunction targetsOf(message) {\n  const context = contextOf(message);\n  return [\n    ...new Set([\n      ...(context?.mentionedJid || []),\n      ...(context?.participant ? [context.participant] : []),\n    ]),\n  ];\n}\n\nasync function groupAction(socket, message, chatId, senderJid, action, command) {\n  if (!chatId.endsWith(\"@g.us\")) {\n    return send(socket, chatId, \"Esse comando só funciona em grupos.\", message);\n  }\n\n  try {\n    const group = await groupData(socket, chatId, senderJid);\n    if (!group.senderAdmin) {\n      return send(socket, chatId, \"Só administradores podem usar esse comando.\", message);\n    }\n    if (!group.botAdmin) {\n      return send(socket, chatId, \"Eu preciso ser administrador do grupo.\", message);\n    }\n\n    const targets = targetsOf(message);\n    if (!targets.length) {\n      return send(\n        socket,\n        chatId,\n        `Marque alguém ou responda à mensagem da pessoa.\\nExemplo: ${PREFIX}${command} @usuario`,\n        message,\n      );\n    }\n\n    await socket.groupParticipantsUpdate(chatId, targets, action);\n    const responses = {\n      remove: \"Membro removido.\",\n      promote: \"Membro promovido a administrador.\",\n      demote: \"Administrador rebaixado.\",\n    };\n    await send(socket, chatId, responses[action], message);\n  } catch (error) {\n    waLogger.error({ err: error, action }, \"Erro em comando de grupo\");\n    await send(socket, chatId, `Erro no comando: ${describeError(error)}`, message);\n  }\n}\n\nasync function everyone(socket, message, chatId, senderJid, body) {\n  if (!chatId.endsWith(\"@g.us\")) {\n    return send(socket, chatId, \"Esse comando só funciona em grupos.\", message);\n  }\n\n  try {\n    const group = await groupData(socket, chatId, senderJid);\n    if (!group.senderAdmin) {\n      return send(socket, chatId, \"Só administradores podem usar esse comando.\", message);\n    }\n    if (!group.botAdmin) {\n      return send(socket, chatId, \"Eu preciso ser administrador do grupo.\", message);\n    }\n\n    await socket.sendMessage(\n      chatId,\n      {\n        text: body.trim() || \"Atenção geral!\",\n        mentions: group.participants.map((participant) => participant.id),\n      },\n      { quoted: message },\n    );\n  } catch (error) {\n    waLogger.error({ err: error }, \"Erro no comando everyone\");\n    await send(socket, chatId, `Erro no comando: ${describeError(error)}`, message);\n  }\n}\n\nasync function info(socket, message, chatId) {\n  const quoted = quotedOf(message);\n  if (!quoted) {\n    return send(socket, chatId, `Responda uma mensagem com ${PREFIX}info.`, message);\n  }\n\n  const result = JSON.stringify(\n    {\n      remoteJid: message.key.remoteJid,\n      quotedMessageId: quoted.key.id,\n      quotedParticipant: quoted.key.participant || null,\n      quotedMessageContent: quoted.message,\n    },\n    (_key, value) => {\n      if (value instanceof Uint8Array || Buffer.isBuffer(value)) {\n        return `<Buffer ${value.length} bytes>`;\n      }\n      if (typeof value === \"bigint\") return value.toString();\n      return value;\n    },\n    2,\n  );\n  await send(socket, chatId, `\\`\\`\\`\\n${result.slice(0, 3500)}\\n\\`\\`\\``, message);\n}\n\nasync function execute(socket, message, chatId, senderJid, isGroup, code) {\n  if (!ENABLE_EVAL) {\n    return send(\n      socket,\n      chatId,\n      \"O comando exec está desativado. Defina ENABLE_EVAL=true somente se necessário.\",\n      message,\n    );\n  }\n  if (isGroup || !ownerOf(senderJid)) return;\n  if (!code.trim()) {\n    return send(socket, chatId, `Uso: ${PREFIX}exec <código JavaScript>`, message);\n  }\n\n  try {\n    const run = new Function(\n      \"sock\",\n      \"client\",\n      \"msg\",\n      \"chatId\",\n      \"jid\",\n      \"senderJid\",\n      `return (async () => {\\n${code}\\n})()`,\n    );\n    const result = await run(socket, socket, message, chatId, chatId, senderJid);\n    const output =\n      result === undefined\n        ? \"Executado sem retorno.\"\n        : typeof result === \"string\"\n          ? result\n          : JSON.stringify(result, null, 2);\n    await send(socket, chatId, output.slice(0, 3500), message);\n  } catch (error) {\n    waLogger.error({ err: error }, \"Erro no exec\");\n    await send(socket, chatId, `Erro: ${describeError(error)}`, message);\n  }\n}\n\nasync function command(socket, message, chatId, senderJid, text) {\n  const parts = text.slice(PREFIX.length).trim().split(/\\s+/);\n  const name = (parts.shift() || \"\").toLowerCase();\n  const body = parts.join(\" \").trim();\n  const isGroup = chatId.endsWith(\"@g.us\");\n\n  switch (name) {\n    case \"menu\":\n    case \"help\":\n      return sendMenu(socket, message, chatId, senderJid);\n    case \"1\":\n    case \"2\":\n    case \"3\":\n    case \"4\":\n      return send(socket, chatId, SUBMENUS[name], message);\n    case \"sticker\":\n    case \"s\":\n    case \"fig\":\n      return sticker(socket, message, chatId);\n    case \"img\":\n    case \"toimg\":\n    case \"imagem\":\n      return toImage(socket, message, chatId);\n    case \"ban\":\n      return groupAction(socket, message, chatId, senderJid, \"remove\", \"ban\");\n    case \"promote\":\n      return groupAction(socket, message, chatId, senderJid, \"promote\", \"promote\");\n    case \"demote\":\n      return groupAction(socket, message, chatId, senderJid, \"demote\", \"demote\");\n    case \"everyone\":\n    case \"all\":\n      return everyone(socket, message, chatId, senderJid, body);\n    case \"ping\":\n      return send(socket, chatId, \"Pong.\", message);\n    case \"uptime\":\n      return send(socket, chatId, `Bot ativo há ${uptime()}.`, message);\n    case \"info\":\n      return info(socket, message, chatId);\n    case \"execute\":\n    case \"exec\":\n    case \"eval\":\n      return execute(socket, message, chatId, senderJid, isGroup, body);\n    default:\n      return send(\n        socket,\n        chatId,\n        `Comando não encontrado. Use ${PREFIX}menu para ver as opções.`,\n        message,\n      );\n  }\n}\n\nfunction setupMessages(socket) {\n  socket.ev.on(\"messages.upsert\", async ({ messages: incoming, type }) => {\n    if (type !== \"notify\") return;\n\n    for (const message of incoming) {\n      remember(message);\n      if (pollUpdateOf(message)) {\n        try {\n          await handleMenuPoll(socket, message);\n        } catch (error) {\n          waLogger.error({ err: error }, \"Erro processando voto da poll\");\n        }\n        continue;\n      }\n      if (\n        !message?.message ||\n        message.key.fromMe ||\n        message.key.remoteJid === \"status@broadcast\"\n      ) {\n        continue;\n      }\n\n      const chatId = message.key.remoteJid;\n      const text = textOf(message).trim();\n      if (!chatId || !text.startsWith(PREFIX)) continue;\n\n      try {\n        await command(socket, message, chatId, senderOf(message), text);\n      } catch (error) {\n        waLogger.error({ err: error }, \"Erro processando mensagem\");\n        await send(\n          socket,\n          chatId,\n          `Erro ao processar o comando: ${describeError(error)}`,\n          message,\n        );\n      }\n    }\n  });\n}\n\nasync function createSocket() {\n  await fs.promises.mkdir(SESSION_DIR, { recursive: true });\n  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);\n\n  if (!state.creds.registered && !PAIRING_NUMBER) {\n    throw new Error(\n      \"PAIRING_NUMBER não configurado. Informe o número internacional somente com dígitos.\",\n    );\n  }\n\n  const socket = makeWASocket({\n    auth: state,\n    browser: Browsers.ubuntu(\"Chrome\"),\n    syncFullHistory: false,\n    markOnlineOnConnect: false,\n    connectTimeoutMs: 60_000,\n    defaultQueryTimeoutMs: 60_000,\n    keepAliveIntervalMs: 25_000,\n    generateHighQualityLinkPreview: false,\n    logger: waLogger,\n    getMessage: async (key) => messages.get(keyFor(key))?.message,\n  });\n\n  socket.ev.on(\"creds.update\", () => {\n    void saveCreds().catch((error) =>\n      waLogger.error({ err: error }, \"Erro salvando credenciais\"),\n    );\n  });\n\n  return { socket, registered: state.creds.registered, saveCreds };\n}\n\nfunction waitForClose(socket, registered) {\n  let pairingRequested = registered;\n  let finished = false;\n  let connectedSuccessfully = false;\n\n  return new Promise((resolve) => {\n    const finish = (result) => {\n      if (finished) return;\n      finished = true;\n      resolve(result);\n    };\n\n    socket.ev.on(\"connection.update\", (update) => {\n      const { connection, lastDisconnect, qr } = update;\n\n      if (\n        !pairingRequested &&\n        (connection === \"connecting\" || Boolean(qr))\n      ) {\n        pairingRequested = true;\n        void (async () => {\n          try {\n            await wait(500);\n            const code = await socket.requestPairingCode(PAIRING_NUMBER);\n            waLogger.info(\n              {\n                code,\n                number: `${PAIRING_NUMBER.slice(0, 3)}***${PAIRING_NUMBER.slice(-2)}`,\n              },\n              \"Pairing code gerado\",\n            );\n          } catch (error) {\n            pairingRequested = false;\n            waLogger.error({ err: error }, \"Erro solicitando pairing code\");\n          }\n        })();\n      }\n\n      if (connection === \"open\") {\n        reconnectAttempts = 0;\n        connectedSuccessfully = true;\n        waLogger.info({ account: socket.user?.id }, \"WhatsApp conectado\");\n        // Don't finish here - keep the socket open and listening for events\n        return;\n      }\n\n      if (connection !== \"close\") return;\n\n      const statusCode = statusCodeFrom(lastDisconnect?.error);\n      waLogger.warn(\n        { statusCode, error: describeError(lastDisconnect?.error) },\n        \"Conexão encerrada\",\n      );\n\n      if (statusCode === DisconnectReason.connectionReplaced) {\n        return finish({ reconnect: false, wipe: false });\n      }\n      if (statusCode === DisconnectReason.loggedOut) {\n        return finish({ reconnect: true, wipe: true });\n      }\n      return finish({\n        reconnect: true,\n        wipe: statusCode === DisconnectReason.badSession,\n      });\n    });\n  });\n}\n\nfunction nextReconnectDelay() {\n  reconnectAttempts += 1;\n  return Math.min(1000 * 2 ** Math.min(reconnectAttempts, 5), MAX_RECONNECT_DELAY) +\n    Math.floor(Math.random() * 500);\n}\n\nasync function removeSession() {\n  await fs.promises.rm(SESSION_DIR, { recursive: true, force: true });\n  waLogger.warn({ sessionDir: SESSION_DIR }, \"Sessão apagada\");\n}\n\nasync function startBot() {\n  if (running) return;\n  running = true;\n  stopping = false;\n\n  waLogger.info(\n    {\n      sessionDir: SESSION_DIR,\n      prefix: PREFIX,\n      ownerConfigured: OWNER_JIDS.size > 0,\n      evalEnabled: ENABLE_EVAL,\n    },\n    \"Iniciando SyntraXBot\",\n  );\n\n  try {\n    while (!stopping) {\n      try {\n        const { socket, registered, saveCreds } = await createSocket();\n        currentSocket = socket;\n        setupMessages(socket);\n        const result = await waitForClose(socket, registered);\n        await saveCreds().catch((error) =>\n          waLogger.error({ err: error }, \"Erro salvando sessão\"),\n        );\n        currentSocket = null;\n\n        if (result.wipe) await removeSession();\n        if (!result.reconnect || stopping) break;\n\n        const delay = nextReconnectDelay();\n        waLogger.info({ delayMs: delay }, \"Reconectando depois da espera\");\n        await wait(delay);\n      } catch (error) {\n        currentSocket = null;\n        waLogger.error({ err: error }, \"Erro no controlador do bot\");\n        if (describeError(error).includes(\"PAIRING_NUMBER não configurado\")) break;\n        await wait(nextReconnectDelay());\n      }\n    }\n  } finally {\n    currentSocket = null;\n    running = false;\n    waLogger.info(\"SyntraXBot encerrado\");\n  }\n}\n\nfunction stopBot() {\n  stopping = true;\n  currentSocket?.end(new Error(\"Encerramento solicitado\"));\n}\n\nconst port = Number(process.env.PORT || 8080);\nconst server = createServer((request, response) => {\n  if (\n    request.url === \"/api/healthz\" ||\n    request.url === \"/healthz\" ||\n    request.url === \"/\"\n  ) {\n    response.writeHead(200, { \"content-type\": \"application/json\" });\n    response.end(JSON.stringify({ status: \"ok\" }));\n    return;\n  }\n\n  response.writeHead(404, { \"content-type\": \"application/json\" });\n  response.end(JSON.stringify({ error: \"Not found\" }));\n});\n\nserver.listen(port, () => {\n  logger.info({ port }, \"Servidor HTTP iniciado\");\n  void startBot();\n});\n\nfunction shutdown(signal) {\n  logger.info({ signal }, \"Encerrando processo\");\n  stopBot();\n  server.close(() => process.exit(0));\n}\n\nprocess.once(\"SIGTERM\", () => shutdown(\"SIGTERM\"));\nprocess.once(\"SIGINT\", () => shutdown(\"SIGINT\"));\n
+import { createServer } from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import pino from "pino";
+import makeWASocket, {
+  Browsers,
+  DisconnectReason,
+  useMultiFileAuthState,
+} from "@whiskeysockets/baileys";
+
+const prefix = process.env.BOT_PREFIX?.trim() || "?";
+const pairingNumber = String(process.env.PAIRING_NUMBER || "").replace(/\D/g, "");
+const sessionDir = process.env.SESSION_DIR?.trim()
+  ? path.resolve(process.env.SESSION_DIR.trim())
+  : path.join(process.cwd(), "data", "auth_info_baileys");
+const port = Number(process.env.PORT) || 8080;
+const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+
+let socket;
+let stopping = false;
+let reconnectAttempt = 0;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function textOf(message) {
+  const content = message?.message;
+  return (
+    content?.conversation ||
+    content?.extendedTextMessage?.text ||
+    content?.imageMessage?.caption ||
+    content?.videoMessage?.caption ||
+    content?.buttonsResponseMessage?.selectedButtonId ||
+    content?.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    ""
+  ).trim();
+}
+
+async function sendText(jid, text, quoted) {
+  if (!socket) return;
+  await socket.sendMessage(jid, { text }, quoted ? { quoted } : undefined);
+}
+
+async function connect() {
+  await fs.promises.mkdir(sessionDir, { recursive: true });
+  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+
+  socket = makeWASocket({
+    auth: state,
+    browser: Browsers.ubuntu("Chrome"),
+    logger: logger.child({ component: "whatsapp" }),
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    generateHighQualityLinkPreview: false,
+  });
+
+  socket.ev.on("creds.update", saveCreds);
+  socket.ev.on("connection.update", async ({ connection, lastDisconnect }) => {
+    if (connection === "open") {
+      reconnectAttempt = 0;
+      logger.info("WhatsApp conectado");
+      return;
+    }
+
+    if (connection !== "close" || stopping) return;
+    socket = undefined;
+    const status = lastDisconnect?.error?.output?.statusCode;
+    const shouldReconnect = status !== DisconnectReason.loggedOut;
+
+    if (!shouldReconnect) {
+      logger.error("Sessão encerrada. Remova a pasta de autenticação para vincular novamente.");
+      return;
+    }
+
+    reconnectAttempt += 1;
+    const delay = Math.min(30_000, 1_000 * 2 ** Math.min(reconnectAttempt, 5));
+    logger.warn({ status, delay }, "Conexão encerrada; reconectando");
+    await sleep(delay);
+    if (!stopping) await connect();
+  });
+
+  socket.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
+    for (const message of messages) {
+      if (!message?.message || message.key.fromMe) continue;
+      const body = textOf(message);
+      if (!body.startsWith(prefix)) continue;
+
+      const [command, ...args] = body.slice(prefix.length).trim().split(/\s+/);
+      const jid = message.key.remoteJid;
+      if (!command || !jid) continue;
+
+      try {
+        switch (command.toLowerCase()) {
+          case "menu":
+          case "help":
+            await sendText(
+              jid,
+              `*SyntraxBot*\n\n${prefix}ping - Verifica se o bot está online\n${prefix}info - Mostra informações da mensagem\n${prefix}menu - Exibe este menu`,
+              message,
+            );
+            break;
+          case "ping":
+            await sendText(jid, "Pong!", message);
+            break;
+          case "info":
+            await sendText(
+              jid,
+              JSON.stringify({ chat: jid, id: message.key.id, args }, null, 2),
+              message,
+            );
+            break;
+          default:
+            await sendText(jid, `Comando não encontrado. Use ${prefix}menu.`, message);
+        }
+      } catch (error) {
+        logger.error({ err: error }, "Erro ao processar mensagem");
+      }
+    }
+  });
+
+  if (!state.creds.registered && pairingNumber) {
+    await sleep(1_000);
+    const code = await socket.requestPairingCode(pairingNumber);
+    logger.info({ pairingCode: code }, "Código de pareamento gerado");
+  }
+}
+
+const server = createServer((request, response) => {
+  if (["/", "/health", "/api/health"].includes(request.url)) {
+    response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    response.end(JSON.stringify({ status: "ok", connected: Boolean(socket) }));
+    return;
+  }
+  response.writeHead(404, { "content-type": "application/json; charset=utf-8" });
+  response.end(JSON.stringify({ error: "Not found" }));
+});
+
+async function shutdown(signal) {
+  if (stopping) return;
+  stopping = true;
+  logger.info({ signal }, "Encerrando processo");
+  try {
+    socket?.end(new Error("Encerramento solicitado"));
+  } finally {
+    server.close(() => process.exit(0));
+  }
+}
+
+server.listen(port, () => {
+  logger.info({ port, sessionDir }, "Servidor HTTP iniciado");
+  connect().catch((error) => {
+    logger.error({ err: error }, "Falha ao iniciar o bot");
+    process.exitCode = 1;
+  });
+});
+
+process.once("SIGTERM", () => shutdown("SIGTERM"));
+process.once("SIGINT", () => shutdown("SIGINT"));
