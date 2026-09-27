@@ -1,18 +1,20 @@
 {
-  "name": "whatsapp-bot-baileys",
+  "name": "baileys-whatsapp-bot",
   "version": "1.0.0",
-  "description": "Base de bot para WhatsApp usando Baileys (pairing code + sessão persistente)",
+  "description": "Bot WhatsApp usando Baileys v7",
+  "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.20",
-    "@hapi/boom": "^10.0.1",
-    "pino": "^9.4.0",
-    "sharp": "^0.33.5"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "engines": {
-    "node": "20"
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "pino": "^9.7.0",
+    "sharp": "^0.34.3"
   }
 }
