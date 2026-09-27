@@ -453,7 +453,7 @@ async function connect() {
 
   const socket = makeWASocket({
     auth: authState,
-    browser: Browsers.ubuntu("SyntraxBot"),
+    browser: Browsers.ubuntu("Chrome"),
     logger: waLogger,
     syncFullHistory: false,
     markOnlineOnConnect: false,
