@@ -14,14 +14,17 @@ import pino from "pino";
 // ============ Configuration ============
 const PREFIX = process.env.BOT_PREFIX?.trim() || "?";
 const PAIRING_NUMBER = String(process.env.PAIRING_NUMBER || "").replace(/\D/g, "");
-const SESSION_DIR = process.env.SESSION_DIR?.trim()
-  ? path.resolve(process.env.SESSION_DIR.trim())
-  : path.join(process.cwd(), "data", "auth_info_baileys");
 const PORT = Number(process.env.PORT) || 8080;
 const ENABLE_EVAL = process.env.ENABLE_EVAL === "true";
 const OWNER_JIDS = new Set(
   (process.env.OWNER_JIDS || "").split(",").filter(Boolean).map((j) => j.trim())
 );
+
+// ============ Session Management - Render Compatible ============
+const USE_RENDER_SESSION = !!process.env.RENDER;
+const SESSION_DIR = USE_RENDER_SESSION 
+  ? "/tmp/wa_session" 
+  : path.join(process.cwd(), "data", "auth_info_baileys");
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const waLogger = logger.child({ component: "whatsapp" });
@@ -493,22 +496,22 @@ async function connect() {
 
     // Handle QR code or pairing code
     if (qr) {
-      waLogger.info("QR Code disponível para scan");
+      waLogger.info("🔲 QR Code disponível para scan");
     }
 
     // Handle pairing code - CORRETO CONFORME BAILEYS
     if (!socket.authState.creds.registered && PAIRING_NUMBER) {
       try {
         const code = await socket.requestPairingCode(PAIRING_NUMBER);
-        waLogger.info({ pairingCode: code }, `Código de pareamento (${PAIRING_NUMBER})`);
+        waLogger.info({ pairingCode: code }, `🔑 Código de pareamento gerado (${PAIRING_NUMBER})`);
       } catch (error) {
-        waLogger.error({ err: error }, "Erro ao gerar código de pareamento");
+        waLogger.error({ err: error }, "❌ Erro ao gerar código de pareamento");
       }
     }
 
     if (connection === "open") {
       reconnectAttempt = 0;
-      waLogger.info({ account: socket.user?.id }, "WhatsApp conectado!");
+      waLogger.info({ account: socket.user?.id, environment: USE_RENDER_SESSION ? "RENDER" : "LOCAL" }, "✅ WhatsApp conectado!");
       return;
     }
 
@@ -571,7 +574,11 @@ async function connect() {
 const server = createServer((request, response) => {
   if (["/", "/health", "/api/healthz"].includes(request.url)) {
     response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-    response.end(JSON.stringify({ status: "ok", connected: !!socket }));
+    response.end(JSON.stringify({ 
+      status: "ok", 
+      connected: !!socket,
+      environment: USE_RENDER_SESSION ? "RENDER (/tmp/wa_session)" : "LOCAL (./data/auth_info_baileys)"
+    }));
     return;
   }
   response.writeHead(404, { "content-type": "application/json; charset=utf-8" });
@@ -592,7 +599,13 @@ async function shutdown(signal) {
 
 // ============ Start Server ============
 server.listen(PORT, () => {
-  logger.info({ port: PORT, sessionDir: SESSION_DIR }, "Servidor HTTP iniciado");
+  const env = USE_RENDER_SESSION ? "🚀 RENDER" : "💻 LOCAL";
+  logger.info({ 
+    port: PORT, 
+    sessionDir: SESSION_DIR,
+    environment: env
+  }, "Servidor HTTP iniciado");
+  
   connect().catch((error) => {
     logger.error({ err: error }, "Falha ao iniciar o bot");
     process.exitCode = 1;
