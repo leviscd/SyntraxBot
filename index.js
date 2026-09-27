@@ -34,6 +34,7 @@ let stopping = false;
 let reconnectAttempt = 0;
 let menuSessions = new Map();
 let messageStore = new Map();
+let pairingCodeGenerated = false;
 
 // ============ Utility Functions ============
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -491,33 +492,54 @@ async function connect() {
 
   socket.ev.on("creds.update", saveCreds);
 
+  // Flag para controlar quando gerar pairing code
+  let isSocketReady = false;
+
   socket.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // Handle QR code or pairing code
+    // Socket está pronto quando recebe QR ou connection event
     if (qr) {
+      isSocketReady = true;
       waLogger.info("🔲 QR Code disponível para scan");
     }
 
-    // Handle pairing code - CORRETO CONFORME BAILEYS
-    if (!socket.authState.creds.registered && PAIRING_NUMBER) {
+    // Gerar pairing code APENAS quando:
+    // 1. Socket está pronto (isSocketReady = true)
+    // 2. Não foi gerado antes (pairingCodeGenerated = false)
+    // 3. Não há sessão registrada
+    // 4. PAIRING_NUMBER está definido
+    if (
+      isSocketReady &&
+      !pairingCodeGenerated &&
+      !socket.authState.creds.registered &&
+      PAIRING_NUMBER
+    ) {
+      pairingCodeGenerated = true;
       try {
         const code = await socket.requestPairingCode(PAIRING_NUMBER);
         waLogger.info({ pairingCode: code }, `🔑 Código de pareamento gerado (${PAIRING_NUMBER})`);
       } catch (error) {
-        waLogger.error({ err: error }, "❌ Erro ao gerar código de pareamento");
+        waLogger.error({ err: error }, "⚠️  Erro ao gerar código de pareamento - continuando...");
+        pairingCodeGenerated = false; // Permitir tentar novamente
       }
     }
 
     if (connection === "open") {
       reconnectAttempt = 0;
-      waLogger.info({ account: socket.user?.id, environment: USE_RENDER_SESSION ? "RENDER" : "LOCAL" }, "✅ WhatsApp conectado!");
+      waLogger.info(
+        { account: socket.user?.id, environment: USE_RENDER_SESSION ? "RENDER" : "LOCAL" },
+        "✅ WhatsApp conectado!"
+      );
       return;
     }
 
     if (connection !== "close" || stopping) return;
 
     socket = null;
+    isSocketReady = false;
+    pairingCodeGenerated = false;
+    
     const statusCode = lastDisconnect?.error?.output?.statusCode;
     const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
@@ -528,7 +550,7 @@ async function connect() {
 
     reconnectAttempt++;
     const delay = Math.min(30_000, 1_000 * 2 ** Math.min(reconnectAttempt, 5));
-    waLogger.warn({ statusCode, delay }, "Reconectando após desconexão");
+    waLogger.warn({ statusCode, delay, attempt: reconnectAttempt }, "🔄 Reconectando...");
     await sleep(delay);
     if (!stopping) await connect();
   });
@@ -603,7 +625,8 @@ server.listen(PORT, () => {
   logger.info({ 
     port: PORT, 
     sessionDir: SESSION_DIR,
-    environment: env
+    environment: env,
+    pairingNumber: PAIRING_NUMBER ? "Configurado" : "Não configurado"
   }, "Servidor HTTP iniciado");
   
   connect().catch((error) => {
