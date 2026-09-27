@@ -7,6 +7,7 @@ const {
   Browsers,
   DisconnectReason,
   downloadMediaMessage,
+  getAggregateVotesInPollMessage,
   useMultiFileAuthState,
 } = await import("baileys").catch(() => import("@whiskeysockets/baileys"));
 import pino from "pino";
@@ -23,6 +24,7 @@ const startedAt = Date.now();
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const waLogger = logger.child({ component: "whatsapp" });
 const messages = new Map();
+const menuSessions = new Map();
 
 let running = false;
 let stopping = false;
@@ -144,6 +146,70 @@ function remember(message) {
   }
 }
 
+function pollUpdateOf(message) {
+  return unwrap(message).pollUpdateMessage || null;
+}
+
+function menuPollKey(update) {
+  return keyFor(update?.pollCreationMessageKey || {});
+}
+
+function menuOptions() {
+  return ["Figurinhas", "Administração", "Utilitários", "Sobre o bot"];
+}
+
+async function sendMenu(socket, message, chatId, senderJid) {
+  const poll = await socket.sendMessage(chatId, {
+    poll: {
+      name: "Menu do SyntraXBot",
+      values: menuOptions(),
+      selectableCount: 1,
+    },
+  });
+  const response = await send(
+    socket,
+    chatId,
+    "Selecione uma categoria na poll acima para ver os comandos.",
+    message,
+  );
+
+  if (poll?.key?.id && response?.key?.id) {
+    menuSessions.set(keyFor(poll.key), {
+      chatId,
+      senderJid: normalizeJid(senderJid),
+      responseKey: response.key,
+      pollMessage: poll,
+      createdAt: Date.now(),
+    });
+  }
+}
+
+async function handleMenuPoll(socket, message) {
+  const update = pollUpdateOf(message);
+  if (!update?.pollCreationMessageKey) return false;
+
+  const session = menuSessions.get(menuPollKey(update));
+  if (!session || normalizeJid(update.voterJid) !== session.senderJid) {
+    return true;
+  }
+
+  const creation = session.pollMessage;
+  const votes = getAggregateVotesInPollMessage({
+    message: creation,
+    pollUpdates: [message],
+  });
+  const selected = menuOptions().find((option) => votes?.[option]?.length > 0);
+  if (!selected) return true;
+
+  const index = menuOptions().indexOf(selected) + 1;
+  await socket.sendMessage(session.chatId, {
+    text: SUBMENUS[String(index)],
+    edit: session.responseKey,
+  });
+  menuSessions.delete(menuPollKey(update));
+  return true;
+}
+
 function unwrap(message) {
   let content = message?.message;
   while (content) {
@@ -250,7 +316,7 @@ function menu() {
 }
 
 async function send(socket, chatId, text, quoted) {
-  await socket.sendMessage(
+  return socket.sendMessage(
     chatId,
     { text },
     quoted ? { quoted } : undefined,
@@ -472,7 +538,7 @@ async function command(socket, message, chatId, senderJid, text) {
   switch (name) {
     case "menu":
     case "help":
-      return send(socket, chatId, menu(), message);
+      return sendMenu(socket, message, chatId, senderJid);
     case "1":
     case "2":
     case "3":
@@ -521,6 +587,14 @@ function setupMessages(socket) {
 
     for (const message of incoming) {
       remember(message);
+      if (pollUpdateOf(message)) {
+        try {
+          await handleMenuPoll(socket, message);
+        } catch (error) {
+          waLogger.error({ err: error }, "Erro processando voto da poll");
+        }
+        continue;
+      }
       if (
         !message?.message ||
         message.key.fromMe ||
