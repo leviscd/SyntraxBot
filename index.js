@@ -40,6 +40,7 @@ const {
   getAggregateVotesInPollMessage
 } = require('@whiskeysockets/baileys')
 
+const fs = require('fs')
 const { Boom } = require('@hapi/boom')
 const pino = require('pino')
 const sharp = require('sharp')
@@ -133,6 +134,16 @@ function stringifyResult(result) {
     return typeof result === 'string' ? result : JSON.stringify(result, null, 2)
   } catch {
     return String(result)
+  }
+}
+
+// Apaga a pasta de sessão inteira (usado quando a sessão morreu de vez)
+async function wipeSession() {
+  try {
+    await fs.promises.rm(SESSION_DIR, { recursive: true, force: true })
+    console.log(`🗑️ Pasta "${SESSION_DIR}" apagada com sucesso.`)
+  } catch (err) {
+    console.error(`❌ Não consegui apagar a pasta "${SESSION_DIR}":`, err)
   }
 }
 
@@ -482,10 +493,17 @@ function setupSocketEvents(sock) {
 
         console.log(`❌ Conexão fechada. Código: ${statusCode ?? 'desconhecido'} | Motivo: ${reason}`)
 
-        const permanentDisconnects = [DisconnectReason.loggedOut, DisconnectReason.badSession, DisconnectReason.connectionReplaced]
-        const shouldStop = permanentDisconnects.includes(statusCode)
+        // Sessão morta de vez - reaproveitar os arquivos salvos não adianta,
+        // então apaga tudo e já parte pra gerar um pairing code novo.
+        const wipeAndRetryReasons = [DisconnectReason.loggedOut, DisconnectReason.badSession]
+        // Outra instância assumiu essa mesma sessão - apagar aqui poderia
+        // brigar com ela, então só paramos e avisamos.
+        const stopReasons = [DisconnectReason.connectionReplaced]
 
-        resolve({ shouldReconnect: !shouldStop, statusCode })
+        const shouldWipeSession = wipeAndRetryReasons.includes(statusCode)
+        const shouldStop = stopReasons.includes(statusCode)
+
+        resolve({ shouldReconnect: !shouldStop, shouldWipeSession, statusCode })
       }
     })
   })
